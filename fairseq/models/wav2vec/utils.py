@@ -11,8 +11,7 @@ def pad_to_multiple(x, multiple, dim=-1, value=0):
     # Inspired from https://github.com/lucidrains/local-attention/blob/master/local_attention/local_attention.py#L41
     if x is None:
         return None, 0
-    # jlee: made small change here to fix FLOP-counting error
-    tsz = int(x.size(dim))
+    tsz = x.size(dim)
     m = tsz / multiple
     remainder = math.ceil(m) * multiple - tsz
     if m.is_integer():
