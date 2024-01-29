@@ -255,6 +255,10 @@ class CrossHubertConfig(FairseqDataclass):
         default=32,
         metadata={"help": "number of global tokens to use"}
     )
+    use_transformer_conv: bool = field(
+        default=False,
+        metadata={"help": "whether to replace transformer feedforward layers with convolutions"}
+    )
 
 
 @register_model("cross_hubert", dataclass=CrossHubertConfig)
@@ -621,6 +625,7 @@ class CrossTransformerEncoder(nn.Module):
                 activation_fn=args.activation_fn,
                 layer_norm_first=args.layer_norm_first,
                 num_global_tokens=self.num_global_tokens,
+                use_transformer_conv=args.use_transformer_conv,
             )
         elif args.layer_type == "conformer":
             layer = ConformerWav2Vec2EncoderLayer(
@@ -862,6 +867,7 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         activation_fn: str = "relu",
         layer_norm_first: bool = False,
         num_global_tokens: int = 32,
+        use_transformer_conv: bool = False,
     ) -> None:
 
         super().__init__()
@@ -893,13 +899,18 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
 
         # layer norm associated with the cross attention layer
         self.cross_attn_layer_norm = LayerNorm(self.embedding_dim)
-        self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
-        self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+        if use_transformer_conv:
+            self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, 3, stride=1, padding=1)
+            self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, 3, stride=1, padding=1)
+        else:
+            self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+            self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
 
         # layer norm associated with the position wise feed-forward NN
         self.final_layer_norm = LayerNorm(self.embedding_dim)
 
         self.num_global_tokens = num_global_tokens
+        self.use_transformer_conv = use_transformer_conv
 
     def forward(
         self,
@@ -967,9 +978,15 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
             x = self.cross_attn_layer_norm(x)
 
             residual = x
-            x = self.activation_fn(self.fc1(x))
+            if self.use_transformer_conv:
+                x = self.activation_fn(self.conv1(x.permute(1, 2, 0)).permute(2, 0, 1))
+            else:
+                x = self.activation_fn(self.fc1(x))
             x = self.dropout2(x)
-            x = self.fc2(x)
+            if self.use_transformer_conv:
+                x = self.conv2(x.permute(1, 2, 0)).permute(2, 0, 1)
+            else:
+                x = self.fc2(x)
 
             layer_result = x
 
