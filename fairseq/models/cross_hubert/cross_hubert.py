@@ -259,6 +259,10 @@ class CrossHubertConfig(FairseqDataclass):
         default=False,
         metadata={"help": "whether to replace transformer feedforward layers with convolutions"}
     )
+    transformer_conv_kernel_size: int = field(
+        default=3,
+        metadata={"help": "kernel size of transformer convolutions"}
+    )
 
 
 @register_model("cross_hubert", dataclass=CrossHubertConfig)
@@ -626,6 +630,7 @@ class CrossTransformerEncoder(nn.Module):
                 layer_norm_first=args.layer_norm_first,
                 num_global_tokens=self.num_global_tokens,
                 use_transformer_conv=args.use_transformer_conv,
+                transformer_conv_kernel_size=args.transformer_conv_kernel_size,
             )
         elif args.layer_type == "conformer":
             layer = ConformerWav2Vec2EncoderLayer(
@@ -868,6 +873,7 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         layer_norm_first: bool = False,
         num_global_tokens: int = 32,
         use_transformer_conv: bool = False,
+        transformer_conv_kernel_size: int = 3,
     ) -> None:
 
         super().__init__()
@@ -900,8 +906,9 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         # layer norm associated with the cross attention layer
         self.cross_attn_layer_norm = LayerNorm(self.embedding_dim)
         if use_transformer_conv:
-            self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, 3, stride=1, padding=1)
-            self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, 3, stride=1, padding=1)
+            transformer_conv_padding = (transformer_conv_kernel_size - 1) // 2
+            self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+            self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
         else:
             self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
             self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
