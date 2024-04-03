@@ -263,6 +263,14 @@ class CrossHubertConfig(FairseqDataclass):
         default=3,
         metadata={"help": "kernel size of transformer convolutions"}
     )
+    use_one_layer_transformer_conv: bool = field(
+        default=False,
+        metadata={"help": "use one layer for the transformer convolution instead of two layers"}
+    )
+    use_no_attn: bool = field(
+        default=False,
+        metadata={"help": "don't use attention"}
+    )
 
 
 @register_model("cross_hubert", dataclass=CrossHubertConfig)
@@ -631,6 +639,8 @@ class CrossTransformerEncoder(nn.Module):
                 num_global_tokens=self.num_global_tokens,
                 use_transformer_conv=args.use_transformer_conv,
                 transformer_conv_kernel_size=args.transformer_conv_kernel_size,
+                use_one_layer_transformer_conv=args.use_one_layer_transformer_conv,
+                use_no_attn=args.use_no_attn,
             )
         elif args.layer_type == "conformer":
             layer = ConformerWav2Vec2EncoderLayer(
@@ -874,6 +884,8 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         num_global_tokens: int = 32,
         use_transformer_conv: bool = False,
         transformer_conv_kernel_size: int = 3,
+        use_one_layer_transformer_conv: bool = False,
+        use_no_attn: bool = False,
     ) -> None:
 
         super().__init__()
@@ -907,8 +919,11 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         self.cross_attn_layer_norm = LayerNorm(self.embedding_dim)
         if use_transformer_conv:
             transformer_conv_padding = (transformer_conv_kernel_size - 1) // 2
-            self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
-            self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+            if use_one_layer_transformer_conv:
+                self.conv = nn.Conv1d(self.embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+            else:
+                self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+                self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
         else:
             self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
             self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
@@ -918,6 +933,8 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
 
         self.num_global_tokens = num_global_tokens
         self.use_transformer_conv = use_transformer_conv
+        self.use_one_layer_transformer_conv = use_one_layer_transformer_conv
+        self.use_no_attn = use_no_attn
 
     def forward(
         self,
@@ -958,41 +975,45 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
             x = residual + x
         else:
             # jlee: new code inserted here
-            global_tokens, x_orig = x.split((self.num_global_tokens, x.shape[0] - self.num_global_tokens), dim=0)
-            global_tokens_padding_mask, x_orig_padding_mask = cross_attn_padding_mask.split((self.num_global_tokens, cross_attn_padding_mask.shape[1] - self.num_global_tokens), dim=1)
+            if self.use_no_attn:
+                attn = None
+            else:
+                global_tokens, x_orig = x.split((self.num_global_tokens, x.shape[0] - self.num_global_tokens), dim=0)
+                global_tokens_padding_mask, x_orig_padding_mask = cross_attn_padding_mask.split((self.num_global_tokens, cross_attn_padding_mask.shape[1] - self.num_global_tokens), dim=1)
 
-            global_tokens, _ = self.cross_attn1(
-                query=global_tokens,
-                key=x_orig,
-                value=x_orig,
-                key_padding_mask=x_orig_padding_mask,
-                need_weights=False,
-            )
-            x_orig, attn = self.cross_attn2(
-                query=x_orig,
-                key=global_tokens,
-                value=global_tokens,
-                key_padding_mask=global_tokens_padding_mask,
-                need_weights=False,
-            )
+                global_tokens, _ = self.cross_attn1(
+                    query=global_tokens,
+                    key=x_orig,
+                    value=x_orig,
+                    key_padding_mask=x_orig_padding_mask,
+                    need_weights=False,
+                )
+                x_orig, attn = self.cross_attn2(
+                    query=x_orig,
+                    key=global_tokens,
+                    value=global_tokens,
+                    key_padding_mask=global_tokens_padding_mask,
+                    need_weights=False,
+                )
 
-            # jlee: new code inserted here
-            x = torch.cat((global_tokens, x_orig), dim=0)
+                x = torch.cat((global_tokens, x_orig), dim=0)
 
-            x = self.dropout1(x)
-            x = residual + x
+                x = self.dropout1(x)
+                x = residual + x
 
-            x = self.cross_attn_layer_norm(x)
+                x = self.cross_attn_layer_norm(x)
 
             residual = x
             if self.use_transformer_conv:
-                x = self.activation_fn(self.conv1(x.permute(1, 2, 0)).permute(2, 0, 1))
+                if self.use_one_layer_transformer_conv:
+                    x = self.conv(x.permute(1, 2, 0)).permute(2, 0, 1)
+                else:
+                    x = self.activation_fn(self.conv1(x.permute(1, 2, 0)))
+                    x = self.dropout2(x)
+                    x = self.conv2(x).permute(2, 0, 1)
             else:
                 x = self.activation_fn(self.fc1(x))
-            x = self.dropout2(x)
-            if self.use_transformer_conv:
-                x = self.conv2(x.permute(1, 2, 0)).permute(2, 0, 1)
-            else:
+                x = self.dropout2(x)
                 x = self.fc2(x)
 
             layer_result = x
