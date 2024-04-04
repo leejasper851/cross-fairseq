@@ -271,6 +271,10 @@ class CrossHubertConfig(FairseqDataclass):
         default=False,
         metadata={"help": "don't use attention"}
     )
+    use_no_ffn: bool = field(
+        default=False,
+        metadata={"help": "don't use feedforward/convolutional layers that follow attention"}
+    )
 
 
 @register_model("cross_hubert", dataclass=CrossHubertConfig)
@@ -641,6 +645,7 @@ class CrossTransformerEncoder(nn.Module):
                 transformer_conv_kernel_size=args.transformer_conv_kernel_size,
                 use_one_layer_transformer_conv=args.use_one_layer_transformer_conv,
                 use_no_attn=args.use_no_attn,
+                use_no_ffn=args.use_no_ffn,
             )
         elif args.layer_type == "conformer":
             layer = ConformerWav2Vec2EncoderLayer(
@@ -886,6 +891,7 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         transformer_conv_kernel_size: int = 3,
         use_one_layer_transformer_conv: bool = False,
         use_no_attn: bool = False,
+        use_no_ffn: bool = False,
     ) -> None:
 
         super().__init__()
@@ -917,16 +923,17 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
 
         # layer norm associated with the cross attention layer
         self.cross_attn_layer_norm = LayerNorm(self.embedding_dim)
-        if use_transformer_conv:
-            transformer_conv_padding = (transformer_conv_kernel_size - 1) // 2
-            if use_one_layer_transformer_conv:
-                self.conv = nn.Conv1d(self.embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+        if not use_no_ffn:
+            if use_transformer_conv:
+                transformer_conv_padding = (transformer_conv_kernel_size - 1) // 2
+                if use_one_layer_transformer_conv:
+                    self.conv = nn.Conv1d(self.embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+                else:
+                    self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
+                    self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
             else:
-                self.conv1 = nn.Conv1d(self.embedding_dim, ffn_embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
-                self.conv2 = nn.Conv1d(ffn_embedding_dim, self.embedding_dim, transformer_conv_kernel_size, stride=1, padding=transformer_conv_padding)
-        else:
-            self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
-            self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
+                self.fc1 = nn.Linear(self.embedding_dim, ffn_embedding_dim)
+                self.fc2 = nn.Linear(ffn_embedding_dim, self.embedding_dim)
 
         # layer norm associated with the position wise feed-forward NN
         self.final_layer_norm = LayerNorm(self.embedding_dim)
@@ -935,6 +942,7 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
         self.use_transformer_conv = use_transformer_conv
         self.use_one_layer_transformer_conv = use_one_layer_transformer_conv
         self.use_no_attn = use_no_attn
+        self.use_no_ffn = use_no_ffn
 
     def forward(
         self,
@@ -1003,23 +1011,26 @@ class CrossTransformerSentenceEncoderLayer(nn.Module):
 
                 x = self.cross_attn_layer_norm(x)
 
-            residual = x
-            if self.use_transformer_conv:
-                if self.use_one_layer_transformer_conv:
-                    x = self.conv(x.permute(1, 2, 0)).permute(2, 0, 1)
-                else:
-                    x = self.activation_fn(self.conv1(x.permute(1, 2, 0)))
-                    x = self.dropout2(x)
-                    x = self.conv2(x).permute(2, 0, 1)
+            if self.use_no_ffn:
+                layer_result = x
             else:
-                x = self.activation_fn(self.fc1(x))
-                x = self.dropout2(x)
-                x = self.fc2(x)
+                residual = x
+                if self.use_transformer_conv:
+                    if self.use_one_layer_transformer_conv:
+                        x = self.conv(x.permute(1, 2, 0)).permute(2, 0, 1)
+                    else:
+                        x = self.activation_fn(self.conv1(x.permute(1, 2, 0)))
+                        x = self.dropout2(x)
+                        x = self.conv2(x).permute(2, 0, 1)
+                else:
+                    x = self.activation_fn(self.fc1(x))
+                    x = self.dropout2(x)
+                    x = self.fc2(x)
 
-            layer_result = x
+                layer_result = x
 
-            x = self.dropout3(x)
-            x = residual + x
-            x = self.final_layer_norm(x)
+                x = self.dropout3(x)
+                x = residual + x
+                x = self.final_layer_norm(x)
 
         return x, (attn, layer_result)
